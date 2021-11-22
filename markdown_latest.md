@@ -1,9 +1,9 @@
 
 -– output: github_document —
 
-## The Relationship between COVID and GA Bond Yields
+## The Relationship between COVID and GA Bond Coupons
 
-### What happened to yields during COVID
+### What happened to coupons during COVID
 
 In March of 2020, municipal bond yields spiked, in many cases increasing
 over a thousand percent. Conditions deteriorated to the point where Kent
