@@ -850,7 +850,7 @@ Many thanks to The Brown Institute for Media Innovation at Columbia
 University and The Pulitzer Center for the grants that made this work
 possible. Special thanks to Mark Hansen and Juan Saldarriaga of the
 Brown Institute and Boyoung Lim of the Pulitzer Center for their help
-and guidance, to Mark Lavine, professor of statistics at the University
+and guidance, to Michael Lavine, professor of statistics at the University
 of Massachussetts Amerst, for statistical consulting and methodological
 vetting, to Ken Foskett, former editor at the Atlanta
 Journal-Constitution, for editing throughout, to J. Scott Trubey of the
