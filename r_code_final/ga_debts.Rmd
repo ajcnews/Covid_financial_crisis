@@ -1,0 +1,1268 @@
+---
+title: "Georgia's Debts"
+author: "Nick Thieme"
+date: "4/1/2021"
+output: github_document
+---
+### Intro
+
+This pipeline takes in already heavily formatted debt data from voluntary petitions and analyzes them, turning the cleaned data into novel inferences about how and which Georgia debtors owe what kinds of debts. 
+
+More specifically, the input data is a dataset of individual debts describing which debtor owes what creditor how much money, as well as the naics classification of the creditor--classified through a deduping process that combines creditor names with canonical names from ReferenceUSA. The amount of the debt is split into secured and unsecured amounts for secured debts and priority or non-priority for unsecured debts. This process is lengthy and described elsewhere.
+
+Here, we join that data with Census data, demographic information about bankruptcy filers and group NAICS codes into larger categories for analysis. 
+
+All of this combines into an analysis that describes discrepancies in the amount owed and the proportion of one's debts that fall into different categories (medical debt, student loans, collections,...) along class and race lines. 
+
+This data is incredibly rich, and this analysis likely does not scratch the surface of the worthwhile inferences trapped below the layers of hard-to-penetrate data.
+
+### Library and setup
+
+```{r setup, include=FALSE}
+
+###Load libraries
+library(tidyverse)
+library(RMySQL)
+library(data.table)
+library(tools)
+library(stringdist)
+library(lubridate)
+library(tidycensus)
+library(sf)
+library(keyring)
+library(DirichletReg)
+library(Compositional)
+library(compositions)
+library(bbplot)
+library(vcd)
+library(effects)
+
+source("~/Desktop/DirichReg_debug.R")
+source("~/Desktop/Covid_financial_crisis/r_code/R_code_library.R")
+options(tigris_use_cache = TRUE)
+
+###Load data and format data for secured debts
+#creditor data
+db_user <- 'nthieme'
+db_password <- key_get("sql")
+db_name <- 'project_cfc'
+db_host <- key_get("sql_intranet") 
+db_port <- 3306
+
+#connect to server
+mydb <-  dbConnect(MySQL(), user = db_user, password = db_password,
+                   dbname = db_name, host = db_host, port = db_port)
+
+sec_cred_data_q <- "SELECT * FROM `pacer_creditors_sec_naics_f`"
+rs <- dbSendQuery(mydb, sec_cred_data_q)
+D_sec_cred_naics <-  fetch(rs, n = -1)%>%data.frame()
+
+#dependents, change in income, number of filers, wage garnishment
+
+bk_data_q <- "SELECT bk_id, addr, mgw_1, mgw_2, rent_or_own, mon_net_inc, net_tot,
+this_year_inc,last_inc, before_inc, employed, assets_r, liabilities_r, total, rent_exp,
+child, food, mon_exp,
+filed_date, court_name, case_chapter, lat, lon
+FROM `pacer_filing_data_pers_t_1`"
+rs <- dbSendQuery(mydb, bk_data_q)
+D_bk_d <-  fetch(rs, n = -1)%>%data.frame() %>% distinct
+
+#code levels of NAICS codes into meaningful categories, discretize income (keeping continuous income for regression, code race,...
+D_sec_cred_naics_f<-D_sec_cred_naics %>% mutate(naics_man_def = fct_collapse(naics_low,
+  medical = c("Abortion Alternatives Organizations","Chiropractors DC","Health Services", "Hospital & Medical Service Plans","Hospital Equipment & Supplies-Mfrs",
+              "Hospitals","Pharmacies","Physical Therapists","Physicians & Surgeons","Surgical Centers",
+              "Ambulance Service","Health Care Management","Home Health Service",
+              "Hospital Consultants","Insurance-Health & Accident",
+              "Drug Abuse & Addiction Info & Treatment","Dentists"),
+  medical_2 = c("Artificial Limbs"),
+  
+  personal = c("Advertising-Computer", 'Aircraft Equipment Parts & Supplies',
+                    "Beauty Salons",
+                    "Coin Dealers Supplies & Etc","Commercial Paper",
+                    "Display Designers & Producers","Escort Service-Personal","Guide Service",
+                    "Delicatessens","Janitor Service","Jewelers-Retail",
+                    "Log Splitting Equipment (Whls)","Manicuring",
+                    "Multimedia (Mfrs)","Restaurants","Shoes-Retail","Spas-Beauty & Day",
+                    "Sporting Goods-Retail",
+                    "Tools (Whls)","Tools-Hand","Tractor-Dealers (Whls)","Wrecker Service",
+                    "Sportswear-Wholesale","Hotels & Motels", "Inns","Resorts",
+                    "Vacation Time Sharing Plans","Phonographs-Coin Operated",
+               "Publishers-Periodical (Mfrs)","Clothing-Retail","Art Galleries & Dealers",
+               "Stereophonic & High Fidelity Equip-Svc","Sports Teams",
+               "Skiing Centers & Resorts","Musicians","Music Instruction-Instrumental",
+               "Merchandise Brokers","Meat-Wholesale","Meat Products (Mfrs)",
+               "Machine Shops (Mfrs)","Lottery Agents","Liquors-Retail",
+               "Health Clubs Studios & Gymnasiums","Gift Shops",
+               "Electronic Equipment & Supplies-Retail","Convenience Stores",
+               "Clubs","Camps","Boxes-Corrugated & Fiber (Whls)",
+               "Beauty Salons-Equipment & Supls (Whls)"
+                    ),
+  
+  housing = c("Apartments","City Government-Housing Programs","Condominiums","Federal Government-Housing Programs",
+              "Federal Government-Urban Planning & Dev","Foreclosure Assistance", "Housing Authorities","Insurance-Mortgage","Landscape Contractors",
+              "Mobile Homes-Parks & Communities","Real Estate Developers","Real Estate",
+              "Rental Agencies","Real Estate Management","Real Estate-Rental Service",
+              "Operators Of Apartment Buildings"
+              ),
+  mortgage = c("Real Estate Loans","Mobile Homes-Dealers","Mortgage Feasibility Consultants"),
+  
+  household = c("Appliances-Household-Major-Dealers","Appliances-Household-Major-Repairing","Construction Management","Electric Contractors",
+                "Burglar Alarm Systems (Whls)","Fence Contractors","Furniture-Dealers-Retail","Furniture-Dealers-Wholesale","Garden Centers",
+                "General Contractors", "Home Builders","Pest Control","Storage-Household & Commercial","Furniture",
+                "Painters","Warehouses-Private & Public","Display Fixtures & Materials (Whls)",
+                "Carpet & Rug Cleaners","Stone-Retail","Sanitation Services","Movers",
+                "Landscape Designers","Contractors","Building Contractors",
+                "Air Conditioning Contractors & Systems"
+                ),
+  
+  associations = c("Associations","Community Organizations",
+                   "Social Service & Welfare Organizations",
+                   "Veterans' & Military Organizations","Non-Profit Organizations",
+                   "Political Organizations","Labor Organizations",
+                   "Fund Raising Counselors & Organizations",
+                   "Employment Contractors-Temporary Help","Consumer Organizations",
+                   "Communications Consultants","Child Care Service"),
+  
+  professional = c("Attorneys","Business Management Consultants","Accountants","Business Services NEC","Consultants-Business NEC",
+                   "Credit & Debt Counseling Services","Financial Advisory Services","Financial Planning Consultants","Financial Trade Services",
+                   "Legal Services","Management Services","Marketing Programs & Services",
+                   "Tax Return Preparation & Filing","Personnel Consultants",
+                   "Photographic Equipment-Repairing","Legal Research","Factors",
+                   "Marketing Consultants"
+                   ),
+  other_insurance = c("Insurance-Property & Casualty","Insurance",
+                      "Insurance Agents Brokers & Service","Insurance-Life (Agents)",
+                      "Insurance Consultants & Advisors"),
+  
+  auto = c("Automobile & Truck Brokers (Whls)","Automobile Auctions (Whls)","Automobile Dealers-New Cars","Automobile Dealers-Used Cars",
+           "Automobile Parts & Supplies-Mfrs","Automobile Renting","Automobile Repairing & Service", "Automobile Title Loans","Electric Motors-Dlrs/Repairing (Whls)",
+           "Financing-Automobile","Fuel Management","Leasing Service","Loans-Automobile","Lubricating Equipment (Whls)","Service Stations-Gasoline & Oil",
+           "Tire-Distributors (Whls)","Title Loans","Truck Renting & Leasing","Truck-Dealers-Used","Trucking",
+           "Automobile Detail & Clean-Up Service","Title Companies","Automobile Leasing",
+           "Tire-Dealers-Retail","Automobile Parts & Supplies-Retail-New"
+           ),
+  
+  sec_banking = c("Banks","Credit Unions","Check Cashing Service","Federally Chartered Credit Unions", "Holding Companies (Non-Bank)","Investment Bankers",
+              "Investments","Investors NEC","Mergers & Acquisitions","Portfolios",
+              "Stock & Bond Brokers","Savings & Loan Associations","Investment Securities",
+              "Investment Management","Holding Companies (Bank)",
+              "Automated Teller Machines"
+              ),
+  
+  gov_other = c("Federal Government Contractors","Government Offices-City, Village & Twp","Government Offices-County","Government Offices-State",
+                "State Government-Executive Offices","Government Offices-US"
+                ),
+  
+  gov_legal = c("City Government-Courts","County Government-Courts",
+                "Federal Government-Courts","Sheriff"),
+  
+  collections = c("Collection Agencies","Billing Service"),
+  
+  tech = c("Computer & Equipment Dealers","Computers-Networking","Internet Service", "Television-Cable & Catv","Wired Telecommunications Carriers",
+           "Wireless Telecomms Carriers (Except Satellite)","Telecommunications Service",
+           "Telecommunications Consultants","Information Retrieval Systs/Equip (Whls)",
+           "Telecommunications Services","Electric Equipment & Supplies-Wholesale"),
+  
+  taxes = c("County Government-Finance & Taxation","State Government-Finance & Taxation",
+            "Public Finance Activities"),
+  
+  sec_credit_card = c("Credit Card & Other Credit Plans","Credit Card-Merchant Services","Credit Reporting Agencies","Financing","Financing Consultants"
+                   ),
+  sec_other_loan = c("Financing-Business","Loans","Loans-Personal","Loans-Alternative"),
+  
+  sec_other = c("Nonclassified Establishments","Services NEC","Churches","Farm Equipment (Whls)",
+            "Farms","Food Products (Whls)","Recycling Equipment & Systems",
+            "Security Guard & Patrol Service","Distribution Services"),
+  
+  pawn_payday = c("Pawnbrokers","Payday Loans"),
+  none = c("none")
+))%>% mutate(amount = as.numeric(amount_owed), 
+             coll = as.numeric(collateral), 
+             underwater = coll<amount,
+             loan_val_c = case_when(between(amount,0, 5000)~"less_than_5",
+                                    between(amount,5000, 50000)~"5_50",
+                                    between(amount,50000, 80000)~"50_150",
+                                    between(amount,80000, 15000000000)~"150+")) %>% 
+  #filter(amount_owed!="none") %>% 
+  left_join(D_bk_d, by = "bk_id") %>% 
+  mutate(filed_date = str_sub(filed_date, 1,10),
+         pandemic = case_when(ymd(filed_date)<ymd("2020-03-11")~"pre_pand",
+                              ymd(filed_date)>=ymd("2020-03-11")~"post_pand"
+                              ),
+         amount_owed = as.numeric(amount_owed))%>% select(-Id) %>% distinct
+
+#we assign high value unknown debt to mortgage.
+D_sec_cred_naics_f[which((D_sec_cred_naics_f$amount_owed>50000)&
+                           (D_sec_cred_naics_f$naics_man_def%in%c("sec_banking", "sec_other_loan",
+                                                                  "sec_other"))),]$
+  naics_man_def<-"mortgage"
+
+##now we join with census data
+#get census data
+GA_census_tract_data<-get_acs(geography = "tract", state = "GA",
+                              variables=c(med_inc="B19013_001",white = "B02001_002", 
+                                          black = "B02001_003", asian = "B02001_005", 
+                                          hispanic = "B03002_012", no_vehicle="B08201_002",
+                                          poverty = "B17001_002"
+                              ),
+                              summary_var = "B01003_001",geometry = TRUE)
+
+geo_data<-GA_census_tract_data %>% select(GEOID) %>% group_by(GEOID) %>% 
+  summarise(geometry= geometry[1])
+
+#get population statistics and spatial join
+census_data<-GA_census_tract_data%>%data.frame %>% select(-geometry, -moe) %>% 
+  pivot_wider(names_from = "variable", values_from = "estimate")
+
+GA_census_tract_data_f<-census_data %>% left_join(geo_data, by = "GEOID") %>% st_as_sf
+
+D_sec_cred_naics_f_geo<-D_sec_cred_naics_f %>%filter(is.na(lon)==FALSE,
+                                                     is.na(lat)==FALSE) %>% 
+  st_as_sf(coords=c("lon","lat")) 
+
+st_crs(GA_census_tract_data_f)<-st_crs(GA_census_tract_data)
+st_crs(D_sec_cred_naics_f_geo)<-st_crs(GA_census_tract_data)
+
+#format newly joined data
+D_sec_cred_naics_f_geo_f<-D_sec_cred_naics_f_geo%>% st_join(GA_census_tract_data_f) %>% 
+  mutate(black_p = black/summary_est, white_p = white/ summary_est, 
+         hisp_p = hispanic/summary_est,
+         race_pred = case_when(white_p>.5~"white", black_p>.5~"black", hisp_p>.5~"hisp"),
+         race_pred = case_when(is.na(race_pred)~"mixed", is.na(race_pred)==FALSE~race_pred)
+         ) %>% data.frame() %>% select(-geometry) %>%
+  mutate(inc_level = case_when(
+           between(mon_net_inc,0, 35000)~"first_q",
+           between(mon_net_inc,35000, 51000)~"q1_to_med",
+           between(mon_net_inc,51000, 95000)~"med_to_3rd",
+           between(mon_net_inc,95000, 1500000000)~"upper+",
+           #between(last_inc_1,150000, 5000000000)~"rich"),
+         ))
+
+###now we do the same thing for our unsecured data
+unsec_cred_data_q <- "SELECT * FROM `pacer_creditors_unsec_naics_f`"
+rs <- dbSendQuery(mydb, unsec_cred_data_q)
+D_unsec_cred_naics <-  fetch(rs, n = -1)%>%data.frame()
+
+D_unsec_cred_naics_f<-D_unsec_cred_naics %>% mutate(naics_man_def = fct_collapse(naics_low,
+    auto = c("Automobile Dealers-Used Cars","Financing-Automobile",
+             "Automobile Dealers-New Cars","Automobile Parts & Supplies-Mfrs",
+             "Tire-Dealers-Retail","Automobile Renting","Department Of Motor Vehicles",
+             "Car Washing & Polishing","Title Companies","Tractor-Dealers (Whls)",
+             "Automobile Body-Repairing & Painting","Fuel Management","Automobile Leasing",
+             "Automobile Title Loans","Brake Service","Loans-Automobile",
+             "Tire-Dealers-Used (Whls)","Trucking","Wrecker Service",
+             "Automobile Radio & Stereo Systs-Sls/Svc","Motorcycles & Motor Scooters-Dealers",
+             "Title Examiners","Electric Motors-Dlrs/Repairing (Whls)",
+             "Automobile Repairing & Service","Automobile Alarms",
+             "Buses-Charter & Rental","Insurance-Automobile","Transportation Authorities",
+             "Truck Renting & Leasing","Truck-Manufacturers","Trucking-Heavy Hauling",
+             "Trucking-Motor Freight","Loans-Automobile",
+             "Motorcycles & Motor Scooters-Painting","Hermetic Motor Rewinding",
+             "Automobile Parts & Supplies-Retail-New","Automobile Air Conditioning Equipment",
+             "Automobile & Truck Brokers (Whls)"),    
+    
+    unsec_banking =c("Banks","Credit Unions","Holding Companies (Non-Bank)","Investments",
+             "Financial Planning Consultants","Investment Bankers",
+             "Federally Chartered Credit Unions","Leasing Service",
+             "Venture Capital Companies","Holding Companies (Bank)","Investment Securities",
+             "Foreign Exchange Brokers & Dealers","Investors NEC","Leasing Equipment",
+             "Savings & Loan Associations","Asset Management",
+             "Banking Systems & Service-Electronic","State Commercial Banks",
+             "Real Estate Loans","Stock & Bond Brokers"),
+    
+    credit_card = c("Credit Card & Other Credit Plans","Credit & Debt Counseling Services",
+                    "Check Cashing Service","Check Cashing Protection Systems",
+                    "Credit Card-Merchant Services","Distribution Services",
+                    "Point Of Sale","Credit Cards-Plastic Metal Etc-Distr",
+                    "Credit Card/Credit Plns Eqpt/Supl (Whls)"),
+    
+    credit_reporting = c("Credit Reporting Agencies"),
+    
+    collections =c("Collection Agencies","Bill Paying Service","Collection Systems",
+                   "Billing Service","Repossessing Service","Debt Buyers"),
+    
+    gov_other = c("Government Offices-County", "Government Offices-State",
+            "Government Offices-City, Village & Twp","Government Offices-US",
+            "Social Security Counselors & Reps","State Government-Social/Human Resources",
+            "County Government-General Offices","Federal Government Contractors",
+            "Federal Government-Conservation Depts","Fire Departments",
+            "Mapping Services (Whls)","Police Departments",
+            "County Government-Finance & Taxation",
+            "Federal/Federally Sponsored Credit Agncs","State Government-Legal Counsel",
+            "City Govt-Regulation/Adm-Comms/Utilities",
+            "County Government-Public Order & Safety",
+            "Government-Individual/Family Social Svcs","State Government-Executive Offices",
+            "State Government-General Offices","State Govt-Correctional Institutions",
+            "Federal Government-General Offices","Federal Government-National Security",
+            "Federal Government-Urban Planning & Dev",
+            "County Government-Social/Human Resources","Bonds-Bail",
+            "City Government-General Offices","City Government-Urban Planning & Dev",
+            "County Government-Courts","County Government-Executive Offices",
+            "County Government-Fire Protection","Libraries-Public","Probation Services",
+            "State Government-Transportation Programs",
+            "State Government-Public Order & Safety","Federal Government-Courts"
+            
+            ),
+    
+    household = c("Furniture-Dealers-Retail","Furniture","Appliances-Household-Major-Dealers",
+                  "Home Centers","Computer Software","Stereophonic & High Fidelity Equip-Svc",
+                  "General Contractors","Security Control Equip & Systems-Whls",
+                  "Computer & Equipment Dealers","Printers (Mfrs)",
+                  "Air Conditioning Contractors & Systems",
+                  "Air Conditioning Supplies & Parts (Whls)","Electric Contractors",
+                  "Lawn & Grounds Maintenance","Pest Control",
+                  "Child Support Collections","Movers","Plumbing Contractors",
+                  "Carpet & Rug Cleaners","Food Products (Whls)","Group Homes",
+                  "Interior Decorators Design & Consultants","Mattresses","Grocers-Retail",
+                  "Roofing Contractors","Vacuum Cleaners-Repairing & Parts",
+                  "Security Systems","Tools (Whls)",
+                  "Burglar Alarm Systems (Whls)","Cabinet Makers",
+                  "Carpet & Rug-Manufacturers","Home Improvements","Home Warranty Plans",
+                  "Locks & Locksmiths","Office Buildings & Parks","Furniture-Manufacturers",
+                  "Computers-Electronic-Manufacturers","Food Products-Retail",
+                  "Counter Tops","Sandblasting","Air Conditioning & Heating-Service/Rpr",
+                  "Stone-Retail","Electronic Equipment & Supplies-Repair",
+                  "Fire Alarm Systems (Whls)","Venetian Blinds-Retail",
+                  "Fruits & Vegetables-Wholesale","Drapery & Curtain Fixtures",
+                  "Energy Conservation Prods-Svcs-Systems","Building Materials",
+                  "Electronic Equipment & Supplies-Retail",
+                  "Washing Machines Dryers/Ironers-Renting",
+                  "Waste Disposal-Hazardous","Air Conditioning Equipment-Repair",
+                  "Commercial Laundry Dryclean Machs (Mfrs)",
+                  "Furniture-Dealers-Showrooms","Furniture-Used",
+                  "General Merchandise-Wholesale","Landscape Contractors",
+                  "Paint-Manufacturers","Plumbing Fixtures & Supplies-Wholesale",
+                  "Turf","Upholstery Cleaners","Vacuum Cleaners-Household-Dealers",
+                  "Ventilating Systems-Cleaning",
+                  "Water Well Drilling & Service","Weed Control Service",
+                  "Wallboard & Plasterboard","Tile-Ceramic-Contractors & Dealers",
+                  "Water Works Contractors","Waste Reduction Disposal Equip-Ind-Mfrs",
+                  "Warehouses-Mini & Self Storage",
+                  "Unsupported Plastics-Film/Sheet (Mfrs)","Rototilling",
+                  "Recycling Centers (Whls)","Maintenance Contractors",
+                  "Mail Sorting Service","Granite (Whls)","Drapery & Curtain Fabrics-Retail",
+                  "Construction Site Clean-Up Services",
+                  "Concrete Prods-Ex Block & Brick (Mfrs)","Computers-Renting & Leasing",
+                  "Computer Integrated Systems Design","Bedding",
+                  "Assembly & Fabricating Service (Mfrs)"
+                  ),
+    
+    housing = c("Apartments","Real Estate","Real Estate Management","Eviction Service",
+                "Rental Agencies",
+                "Building Maintenance","Real Estate Developers","Condominiums",
+                "Home Builders","Mortgage Feasibility Consultants","Building Contractors",
+                "Buildings-Metal",
+                "Rental Service-Stores & Yards","Retirement Communities & Homes",
+                "Real Estate Buyers & Brokers",
+                "Property Management-Commercial","Campgrounds","Buildings-Portable",
+                "Real Estate Consultants", "Housing Authorities","Condominiums-Time Sharing",
+                "Construction Companies","Contractors-Equip/Supls-Dlrs/Svc (Whls)",
+                "Insurance-Mortgage","Real Estate-Rental Service","Registered Agents",
+                "Real Estate Investments","Student Housing",'Real Estate Appraisers',
+                "Patio & Deck Builders","Paint-Retail",
+                "Operators Of Nonresidential Buildings","Mobile Homes-Parks & Communities",
+                "Foreclosure Assistance","Artificial Limbs"
+                
+                ),
+    
+    unsec_loans = c("Loans","Financing","Financial Advisory Services","Loans-Personal",
+              "Financing-Business","Loan Brokerage","Loans-Alternative"),
+    
+    medical = c("Physicians & Surgeons","Medical Business Administration","Hospitals",
+                "Clinics","Medical Centers","Dentists","Laboratories-Medical",
+                "Health Services","Ambulance Service","Nurses-Practitioners",
+                "Health Care Management","Physicians Assistants",
+                "Nurses-Licensed-Anesthetist","Home Health & Health Care Equipment",
+                "Physicians & Surgeons Equip & Supls-Whls","Home Health Service",
+                "Occupational Therapists","Rehabilitation Services","Veterinarians",
+                "Health Plans","Pathologists","Physical Therapists","Surgical Centers",
+                "Chiropractors DC","Long Term Care Facility",
+                "Physicians & Surgeons-Emergency Service",
+                "Research & Development In Biotechnology","Ophthalmologists",
+                "Pharmacies","Physicians & Surgeons Information Bureau","Anesthetists",
+                "Emergency Minor Medical Facilities/Svcs","Health Care Instruction",
+                "Hearing Aids","Hospital Equipment & Supplies (Whls)","Laboratories-Testing",
+                "Medical & Surgical Svc Organizations","Medical Groups",
+                "Mental Health Services","Nurses & Nurses' Registries","Optical Goods-Retail",
+                "Optometrists OD","Podiatrists","Psychologists",
+                "Pharmaceutical Products-Wholesale","Surgical Instruments-Manufacturers",
+                "Addiction Treatment Centers","Oxygen (Whls)","Laboratories-Dental",
+                "Sports Consultants","Dental Hygienists","Health & Fitness Program Consultants",
+                "Drug Abuse & Addiction Info & Treatment",
+                "Alcoholism Information & Treatment Ctrs",
+                "Insurance-Health & Accident","Nursing & Convalescent Homes",
+                "Cognitive Disability-Dev Disability Svcs","Cosmetic Dentistry",
+                "Counseling Services","Counselors-Licensed Professional",
+                "Dermatologists","Diagnostic Imaging Centers","Home Managing Services",
+                "Hospital Equipment & Supplies-Mfrs","Insurance Prescription Drug Plans",
+                "Laboratory Equipment & Supplies (Whls)","Medical Alarms (Whls)",
+                "Medical Equipment-Repairing", "Medical Legal Consultants",
+                "Medical Transportation","Optical Goods-Wholesale",
+                "Orthopedic Appliances-Manufacturers","Pain Control","Paramedics",
+                "Physicians & Surgeons Equip & Supls-Mfrs","Residential Care Homes",
+                "Respiratory Therapists","Retirement & Life Care Cmnty/Homes Info",
+                "Speech Pathologists","Sports Medicine & Injuries",
+                "X-Ray Laboratories Medical & Dental","Orthopedic Surgeons",
+                "Medical Records Service","Medical Management Service",
+                "Health Information & Referral Programs",
+                "Emergency Medical & Surgical Service","Air Ambulance Service",
+                "Health & Nutrition Consultants","Health Care Facilities"
+                
+                ),
+    
+    associations = c("Family & Children Services","Employee Assistance Programs",
+                     "Child Care Service","Non-Profit Organizations",
+                     "Social Service & Welfare Organizations",
+                     "Fund Raising Counselors & Organizations",
+                     "Employment Contractors-Temporary Help",
+                     "Facilities Support Management Services","Associations",
+                     "Human Services Organizations","Employment Agencies & Opportunities",
+                     "Miscellaneous Personal Services NEC","Consumer Organizations",
+                     "Employment Service-Employee Leasing","Fraternal Organizations",
+                     "Veterans' & Military Organizations","Organizations",
+                     "Senior Citizens Service","Cooperatives",
+                     "Senior Citizens Service Organizations"),
+    
+    unsec_other = c("Nonclassified Establishments","Business Management Consultants","Services NEC",
+              "Business Services NEC","Security Guard & Patrol Service",
+              "Marketing Consultants","Factors","Churches",
+              "Information Retrieval Systs/Equip (Whls)","Chemicals (Whls)",
+              "Online Services","Recycling Equipment & Systems",
+              "Service Stations-Gasoline & Oil","Taxicabs & Transportation Service",
+              "Janitor Service","Skip Tracing",
+              "Importers (Whls)",
+              "Manufacturers-Agents & Representatives",
+              "Warehouses-Private & Public",
+               "Exporters (Whls)",
+              "Farms",
+              "Aircraft Equipment Parts & Supplies","Aluminum (Whls)",
+              "Farm Supplies (Whls)","Garbage Collection",
+              "Investigators","Lecture & Seminar Bureaus",
+              "Painters Equipment & Supplies (Whls)", "Stables","Towers (Mfrs)",
+              "Aircraft Engines & Engine Parts-Mfrs","Railroad Car Leasing",
+              "Local Passenger Transportation NEC","Cemeteries","Funeral Directors",
+              "Truck Stops & Plazas","Appraisers","Anti-Freeze Compounds-Manufacturers",
+              "Can-Manufacturers","Catalog Compilers (Mfrs)","Consultants-Business NEC",
+              "Crematories","Designers-Industrial","Doors","Dry Wall Contractors" ,
+              "Engineers-Designing","Financial Planners-Certified",
+              "Food Products & Manufacturers","Food Service-Distributors (Whls)",
+              "Foresters-Consulting","Franchising","Freight-Forwarding",
+              "Fruits & Vegetables & Produce-Retail","Heat Treating Metal (Mfrs)",
+              "Landfills-Sanitary","Lumber-Wholesale","Misc Equipment-Rental & Leasing",
+              "Miscellaneous Food Stores","Model Makers (Mfrs)",
+              "Packaging Materials-Wholesale","Parks","Publishers (Mfrs)",
+              "Publishers-Directory & Guide (Mfrs)","Radio Paging/Signaling Eqpt Systs (Whls)",
+              "Sand & Gravel (Whls)","Sanitation Consultants","Security Systems Consultants",
+              "Shipping Agents","Shoring","Solar Energy Eqpt/Syst-Supl/Parts (Whls)",
+              "Warehouses-Merchandise & Self Storage","Welding"
+              ),
+    
+    pawn_payday = c("Pawnbrokers","Payday Loans"),
+    
+    professional = c("Insurance","Accountants","Marketing Programs & Services",
+                     "Attorneys","Financing Consultants","Management Services",
+                     "Accounting & Bookkeeping General Svc",
+                     "Call Centers","Insurance Adjusters","Tax Return Preparation & Filing",
+                     "Advertising-Agencies & Counselors","Communications Consultants",
+                     "Legal Services", "Counselors",
+                     "Insurance-Claim Processing Services","Insurance-Excess & Surplus",
+                     "Missions","Office Supplies","Packaging Service",
+                     "Public Relations Counselors","Tax Consultants",
+                     "Office Supplies-Wholesale",
+                     "Advertising-Specialties (Whls)","Technical Writing","Business Brokers",
+                     "Recording Studios","Advertising-Promotional",
+                     "Engineering-Job Shops","Engineers-Professional","Sales Promotion Service",
+                     "Graphic Designers","Advertising-Computer",
+                     "Advertising-Directory & Guide","Bankruptcy Service",
+                     "Document Preparation Service","Media Buying Service",
+                     "Personnel Consultants","Promotions & Fund Raising",
+                     "Payroll Preparation Service","Executive Search Consultants",
+                     "Crude Petroleum & Natural Gas Extraction",
+                     "Architectural Illustrators","Office & Desk Space-Rental",
+                     "Misc Indstrl Equip & Supls NEC (Whls)",
+                     "Material Handling Equipment (Whls)","Legal Clinics",
+                     "Janitors Equipment/Supplies (Whls)","Human Resource Consultants",
+                     "Fingerprint Experts","Financial Management & Consulting",
+                     "Engineers-Sanitary","Drilling & Boring Contractors",
+                     "Automation Consultants"),
+    
+    personal = c("Restaurants","Jewelers-Retail","Clothing-Retail",
+                 "Restaurant Equipment & Supplies (Whls)","Skateboards & Equipment",
+                 "Gift Shops","Health Clubs Studios & Gymnasiums","Bakers-Retail",
+                 "Resorts","Beauty Salons","Shoes-Retail","Women's Apparel-Wholesale",
+                 "Bars","Outdoor Living","Storage-Household & Commercial",
+                 "Cosmetics & Perfumes-Retail","Marriage & Family Counselors",
+                 "Concessionaires","Convenience Stores","Hotels & Motels",
+                 "Salvage & Surplus Merchandise","Lingerie","Travel Agencies & Bureaus",
+                 "Art Galleries & Dealers","Barbers","Coffee Shops",
+                 "Jewelers-Wholesale","Publishers-Periodical (Mfrs)","Sports-Indoor",
+                 "Women's Apparel-Retail","Animal Hospitals","Museums",
+                 "Newspapers (Publishers/Mfrs)","Radio Stations & Broadcasting Companies",
+                 "Shopping Centers & Malls","Casinos","Collectibles","Computer Services",
+                 "Crafts","Florists-Retail","Food Service-Management","Golf Courses",
+                 "Jewelry Designers","Liquors-Retail","Music Instruction-Instrumental",
+                 "Music Production Consultants","Orchards", "Sporting Goods-Retail",
+                 "Sports Clubs","Vacation Rentals","Wedding Honeymoon Planners",
+                 "Weight Control Services","Diamonds","Boat Dealers Sales & Service",
+                 "Courier Services","Arts Organizations & Information",
+                 "Stadiums Arenas & Athletic Fields","Delivery Service",
+                 "Vacation Time Sharing Plans","Gold Silver & Platinum-Dealers",
+                 "Bed & Breakfast Accommodations","Sporting Goods-Wholesale",
+                 "Records Tapes & Compact Discs-Retail","Tattooing","Escort Service-Personal",
+                 "Airports","Amusement Places","Apparel & Garments-Retail",
+                 "Archery Equipment & Supplies","Billiard Parlors",
+                 "Boat Equipment & Supplies","Book Dealers-Retail","Bowling Centers",
+                 "Caterers","Cooking Utensils","Giftwares-Manufacturers",
+                 "Graduation Supplies & Services","Halls & Auditoriums",
+                 "Health Food Products-Wholesale","Health Spas","Leather Goods-Dealers",
+                 "Magazines-Subscription Agents","Marine Repairs","Meal Preparation Services",
+                 "Miscellaneous Retail Stores NEC","Motels & Hotels Reservations",
+                 "Musical Instruments-Dealers","Party Supplies","Pet Services",
+                 "Pet Washing & Grooming","Photographers-Commercial","Pizza",
+                 "Spas-Beauty & Day","Sportswear-Retail","Sunglasses & Sun Goggles",
+                 "Swimming Pools-Private","Tanning Salons","Tours-Operators & Promoters",
+                 "Toys-Manufacturers","Vending Machines", "Video Tapes & Discs-Wholesale",
+                 "Wholesalers","Seafood-Wholesale","Wigs Toupees & Hairpieces",
+                 "Slides & Film Strips","Decals (Mfrs)","Watches-Dealers",
+                 "Swimming Pool Contrs Dealers & Designers",
+                 "Sports & Recreation Facilities Program","Hosiery-Manufacturers",
+                 "Food Brokers (Whls)","Clubs","Wholesale","Television-Rental",
+                 "Publishers-Representatives","Pet Supplies & Foods-Retail","Noodles (Mfrs)",
+                 "Men's Clothing & Furnishings-Retail","Marinas","Entertainment Bureaus",
+                 "Dairy Farms","Crane Service","Cocktail Lounges","Castings (Mfrs)",
+                 "Apparel-Mens-Wholesale","Amusement & Theme Parks","Aircraft Schools"
+                 ),
+
+    student_loans = c("Schools","Educational Consultants",
+                      "Schools-Universities & Colleges Academic",
+                      "Educational Service-Business",
+                      "Junior-Community College-Tech Institutes",
+                      "Educational Programs",
+                      "Schools & Educational Services NEC",
+                      "Schools With Special Academic Education",
+                      "Schools-Nursery & Kindergarten Academic",
+                      "Nurses Schools","Education Centers"
+                      ),
+    
+    taxes = c("Public Finance Activities","State Government-Finance & Taxation",
+              "City Government-Finance & Taxation"),
+    
+    tech = c("Communications","Computer Training","Computers-System Designers & Consultants",
+             "Data Processing Service","Cable/Wire-Installation-Voice/Data Syst",
+             "Cellular Telephones-Equipment & Supls","Computer Software-Wholesale",
+             "Information Bureaus","Satellite Equipment & Systems-Wholesale",
+             "Information Equip & Systems","Computer Consultants",
+             "Computer Parts & Supplies","Computers-Networking","Computers-Service & Repair",
+             "Computers-Support Services","Information & Referral Svcs"),
+    
+    utilities = c("Wireless Telecomms Carriers (Except Satellite)",
+             "Wired Telecommunications Carriers","Satellite Equipment & Systems-Retail",
+             "Electric Companies","Energy Management Systems & Products",
+             "Telecommunications Services", "Internet Service","Television-Cable & Catv",
+             "Gas Companies","Internet Svcs-Network Designers/Conslnt","Gas-Natural",
+             "Satellite Equip & Systems-Svc & Repair","Television Stations & Broadcasting Co",
+             "Gas-Liquefied Petro-Bttld/Bulk (Whls)","Water & Sewage Companies-Utility",
+             "Communications Services-Common Carriers","Oil & Gas Exploration & Development",
+             "Utility Contractors","Waste Disposal"
+             ),
+    
+    )
+) %>% #filter(amount_owed!="none") %>% 
+  left_join(D_bk_d, by = "bk_id") %>% 
+
+mutate(filed_date = str_sub(filed_date, 1,10),
+       pandemic = case_when(ymd(filed_date)<ymd("2020-03-11")~"pre_pand",
+                              ymd(filed_date)>=ymd("2020-03-11")~"post_pand"
+  )) %>% select(-Id) %>% distinct
+
+D_unsec_cred_naics_f_geo<-D_unsec_cred_naics_f %>%filter(is.na(lon)==FALSE,
+                                                     is.na(lat)==FALSE) %>% 
+  st_as_sf(coords=c("lon","lat")) 
+
+st_crs(GA_census_tract_data_f)<-st_crs(GA_census_tract_data)
+st_crs(D_unsec_cred_naics_f_geo)<-st_crs(GA_census_tract_data)
+
+D_unsec_cred_naics_f_geo_f<-D_unsec_cred_naics_f_geo%>% st_join(GA_census_tract_data_f) %>% 
+  mutate(black_p = black/summary_est, white_p = white/ summary_est, 
+         hisp_p = hispanic/summary_est,
+         race_pred = case_when(white_p>.5~"white", black_p>.5~"black", hisp_p>.5~"hisp"),
+         race_pred = case_when(is.na(race_pred)~"mixed", is.na(race_pred)==FALSE~race_pred)
+  ) %>% data.frame() %>% select(-geometry)
+
+D_sec_cred_naics_f_geo_f_2<-D_sec_cred_naics_f_geo_f %>% 
+  select(c(-collateral, -unsecured, -amount,-coll,-underwater, -loan_val_c, -inc_level)) %>% 
+  add_column(type = "secured") 
+
+D_unsec_cred_naics_f_geo_f_2<-D_unsec_cred_naics_f_geo_f %>%
+  select(-type) %>% add_column(type = "unsecured") 
+
+D_cred_naics_f <- rbind(D_sec_cred_naics_f_geo_f_2,D_unsec_cred_naics_f_geo_f_2 )%>% 
+  mutate(mon_net_inc = as.numeric(mon_net_inc)*12,
+         mon_net_inc = case_when(is.na(mon_net_inc)~med_inc, is.na(mon_net_inc)==FALSE~mon_net_inc),
+         
+         inc_level = case_when(
+           between(mon_net_inc,0, 28440)~"first_q",
+           between(mon_net_inc,28441, 56942)~"q1_to_med",
+           between(mon_net_inc,56943, 102091)~"med_to_3rd",
+           between(mon_net_inc,102092, 1500000000)~"upper+",
+           #between(last_inc_1,150000, 5000000000)~"rich"),
+  ),
+  amount_owed= as.numeric(amount_owed))
+
+###this is currently unused code to check whether the bks are making their way to the final dataset. this was useful while writing the pipeline, but the pipeline is working quite well now
+
+##sanity checks on number of bks
+#these are the bks missing from the debt data as a whole.
+# bk_list_debt_og<-c(D_unsec_cred_naics$bk_id,D_sec_cred_naics$bk_id) %>% unique
+# missing_bk_inds<-which((D_bk_d$bk_id %>% unique)%in%bk_list_debt_og==FALSE)
+# missing_bks<-(D_bk_d$bk_id %>% unique)[missing_bk_inds]
+# 
+# ##these are the bks missing from the geo'd data.this is about 1% when included nones
+# bk_list_debt_geo<-D_cred_naics_f$bk_id %>% unique
+# missing_bk_inds_geo<-which((D_bk_d$bk_id %>% unique)%in%bk_list_debt_geo==FALSE)
+# missing_bks_geo<-(D_bk_d$bk_id %>% unique)[missing_bk_inds_geo]
+# missing_bks_geo_f<-missing_bks_geo[(missing_bks_geo%in%missing_bks==FALSE) %>% {which(.)}]
+# 
+# #check different debt lists
+# D_unsec_cred_naics %>% filter(bk_id %in% missing_bks)
+# D_sec_cred_naics %>% filter(bk_id %in% missing_bks)
+```
+
+# Data and EDA
+With the data loaded, we can start our analyses. 
+
+Currently, the data is a table of individual debts with variables specifying which debtor owes the debt, the name of the company to whom the debt is owed, the naics code of the company, the amount owed for this particular debt, the home address of the debtor, a variety of characteristics about the debtor including monthly income, total assets and liabilities,..., and characteristics of the filer's home census tract including median income, race statistics,...
+
+To prefigure some later results, we show density plots of the differences in mortgage debt by income, student loans by race and auto debt by race. 
+
+
+```{r}
+D_cred_naics_f %>% filter(naics_man_def=="mortgage", race_pred%in%c("white","black")) %>% ggplot(aes(x = amount_owed, fill= inc_level))+geom_density(alpha = .5)+bbc_style()
+  
+D_cred_naics_f %>% filter(naics_man_def=="student_loans", race_pred%in%c("white","black")) %>% ggplot(aes(x = amount_owed, fill= race_pred))+geom_density(alpha = .5)+bbc_style()
+
+D_cred_naics_f %>% filter(naics_man_def=="auto", race_pred%in%c("white","black")) %>% ggplot(aes(x = amount_owed, fill= race_pred))+geom_density(alpha = .5)+bbc_style()
+```
+
+We can clearly see that each wealth quartile owes significantly more mortgage debt than the previous quartile. This is easily understood as rich people can get loans for houses, while poorer people can't.
+
+Interestingly, there is only a slight difference in the raw total amount of student loan debt owed by black and white filers. We will return to this.
+
+Lastly, there is a clear difference in the distribution of auto debt owed by black filers and white filers, with more black filers owing more auto debt than white filers. We rely on Robert Lawless and Mary Hansen to explain this in the story. 
+
+One caveat with our data load is that there's a bug with the DirichReg function that leads properly converged optimizations to report non-convergence. We source the DirichReg_debug code to fix that bug. 
+
+
+### T-tests and Z-tests
+However, while these visual difference can be useful guiding principles, we need to know the degree to which they can be substantiaed. This is especially important in high-dimensional data. 
+
+To do this, we supplement our raw data with so-called compositional data. Compositional data transforms a list of related raw variables into the proportion of the whole that each varible represents. In our case, that means converting the raw amount of student loan debt, mortgage debt, ..., into the proportion of an individuals debt that falls into the category of student loans, mortgages,... 
+
+We then perform two-sample t-tests for differences in the raw totals of debt by race and income. One issue we need to be very careful about, however, is multiple comparisons. 
+
+By making raw and compositional comparisons over race and income, we are performing 8 hypothesis tests (2 for race + 6 for income) per debt type. With 26 debt types, that means we're performing 208 tests (really 202 because one debt type doesn't have enough observations to support the income tests). If we don't correct for multiple comparisons, we could easily fall into the trap of randomness. Thus, we correct with Benjamini-Hochberg.
+
+```{r cars}
+#this code creates compositional data from our raw data
+race_pandemic_naics_man_tbl<-D_cred_naics_f %>%filter(amount_owed!="none") %>% 
+  group_by(race_pred, pandemic) %>% 
+  mutate(n_filers_race = length(unique(bk_id))) %>% 
+  group_by(race_pred, pandemic, naics_man_def) %>% 
+  summarise(n_debts = n(),
+            n_filers = length(unique(bk_id)),
+            tot_d = sum(as.numeric(amount_owed), na.rm= TRUE),
+            avg_d = mean(as.numeric(amount_owed), na.rm=TRUE),
+            sd_d = sd(as.numeric(amount_owed), na.rm=TRUE),
+            avg_n_have = n_debts / n_filers,
+            n_filers_race = n_filers_race[1]) %>% ungroup %>% 
+  group_by(race_pred,pandemic) %>% 
+  mutate(perc_of_filers = n_filers/n_filers_race) %>% 
+  arrange(desc(perc_of_filers)) %>% select(-avg_n_have) %>% 
+  filter(race_pred!="hisp")
+
+#this lets you see differences within races
+diff_pand<-race_pandemic_naics_man_tbl %>% ungroup %>% 
+  pivot_wider(names_from = c(pandemic),
+              values_from = c(n_filers,perc_of_filers, tot_d, avg_d,sd_d,n_debts,n_filers_race)) %>% 
+  mutate(diff_tot = tot_d_pre_pand/tot_d_post_pand,
+         diff_avg = avg_d_post_pand-avg_d_pre_pand,
+         diff_num = n_filers_pre_pand-n_filers_post_pand,
+         diff_perc = perc_of_filers_pre_pand-perc_of_filers_post_pand) 
+
+#here we perform proportion tests and and two-sample t tests of the compositions and raw differences. there's a lot of manual coding here to get the tests into our tidy data,
+#but it makes the inference a little easier
+
+diff_pand_tbl<-diff_pand %>% filter(race_pred!="other") %>% 
+  pivot_wider(names_from = c(race_pred),
+              values_from = c(n_filers_pre_pand,n_filers_post_pand,
+                              perc_of_filers_pre_pand, perc_of_filers_post_pand,
+                              tot_d_pre_pand, tot_d_post_pand,
+                              avg_d_pre_pand,sd_d_pre_pand, n_debts_pre_pand,
+                              avg_d_post_pand,sd_d_post_pand, n_debts_post_pand,
+                              n_filers_race_pre_pand, n_filers_race_post_pand,
+                              diff_tot, diff_avg, diff_num, diff_perc),
+              ) %>% 
+  mutate(diff_perc_pand_race=diff_perc_black-diff_perc_white,
+         diff_perc_race=perc_of_filers_post_pand_black-perc_of_filers_post_pand_white,
+         diff_avg_pand_race=diff_avg_black-diff_avg_white,
+         diff_avg_race=avg_d_post_pand_black- avg_d_post_pand_white) %>%  
+  filter(n_filers_race_post_pand_white>20,
+         n_filers_pre_pand_black<n_filers_race_post_pand_black,
+         n_filers_pre_pand_white<n_filers_race_post_pand_white) %>% 
+  rowwise %>% 
+  mutate(test_l_p = prop.test(x=c(n_filers_pre_pand_black,n_filers_pre_pand_white), 
+                            n=c(n_filers_race_post_pand_black,n_filers_race_post_pand_white))$
+           conf.int[1],
+         test_u_p = prop.test(x=c(n_filers_pre_pand_black,n_filers_pre_pand_white), 
+                            n=c(n_filers_race_post_pand_black,n_filers_race_post_pand_white))$
+           conf.int[2],
+         p.val_p = prop.test(x=c(n_filers_pre_pand_black,n_filers_pre_pand_white), 
+                            n=c(n_filers_race_post_pand_black,n_filers_race_post_pand_white))$
+           p.value,
+         test_diff = t.test2(avg_d_post_pand_black, avg_d_post_pand_white, sd_d_post_pand_black,sd_d_post_pand_white,n_debts_post_pand_black,n_debts_post_pand_white )[1],
+        test_l_avg= test_diff-1.96*t.test2(avg_d_post_pand_black, avg_d_post_pand_white, sd_d_post_pand_black,sd_d_post_pand_white,n_debts_post_pand_black,n_debts_post_pand_white )[2],
+         test_u_avg = test_diff+1.96*t.test2(avg_d_post_pand_black, avg_d_post_pand_white, sd_d_post_pand_black,sd_d_post_pand_white,n_debts_post_pand_black,n_debts_post_pand_white )[2],
+         p.val_avg=t.test2(avg_d_post_pand_black, avg_d_post_pand_white, sd_d_post_pand_black,sd_d_post_pand_white,n_debts_post_pand_black,n_debts_post_pand_white )[4]
+         ) 
+
+#now we do the same thing with income
+inc_pandemic_naics_man_tbl<-D_cred_naics_f %>%filter(amount_owed!="none") %>% 
+  group_by(inc_level) %>% 
+  mutate(n_filers_race = length(unique(bk_id))) %>% 
+  group_by(inc_level, naics_man_def) %>% 
+  summarise(n_debts = n(),
+            n_filers = length(unique(bk_id)),
+            tot_d = sum(as.numeric(amount_owed), na.rm= TRUE),
+            avg_d = mean(as.numeric(amount_owed), na.rm=TRUE),
+            sd_d = sd(as.numeric(amount_owed), na.rm=TRUE),
+            avg_n_have = n_debts / n_filers,
+            n_filers_race = n_filers_race[1]) %>% ungroup %>% 
+  group_by(inc_level) %>% 
+  mutate(perc_of_filers = n_filers/n_filers_race) %>% 
+  arrange(desc(perc_of_filers)) %>% select(-avg_n_have) %>% 
+  filter(inc_level!="upper+")
+
+diff_pand_tbl_inc<-inc_pandemic_naics_man_tbl  %>% na.omit %>% 
+  pivot_wider(names_from = inc_level,
+              values_from = c(n_filers,
+                              n_filers_race,
+                              perc_of_filers, 
+                              tot_d, 
+                              avg_d,sd_d, n_debts
+                              )
+              ) %>% 
+  filter(n_filers_race_q1_to_med>20) %>% 
+  rowwise %>% na.omit %>% 
+  mutate(
+    test_l_p_1_2 = prop.test(x=c(n_filers_first_q,n_filers_q1_to_med), 
+                            n=c(n_filers_race_first_q,n_filers_race_q1_to_med))$
+           conf.int[1],
+         
+    test_u_p_1_2 = prop.test(x=c(n_filers_first_q,n_filers_q1_to_med), 
+                            n=c(n_filers_race_first_q,n_filers_race_q1_to_med))$
+           conf.int[2],
+    
+    p.val_p_1_2 = prop.test(x=c(n_filers_first_q,n_filers_q1_to_med), 
+                            n=c(n_filers_race_first_q,n_filers_race_q1_to_med))$
+           p.value,
+    
+    test_l_p_1_3 = prop.test(x=c(n_filers_first_q,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_first_q,n_filers_race_med_to_3rd))$
+           conf.int[1],
+         
+    test_u_p_1_3 = prop.test(x=c(n_filers_first_q,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_first_q,n_filers_race_med_to_3rd))$
+           conf.int[2],
+    
+    p.val_p_1_3 = prop.test(x=c(n_filers_first_q,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_first_q,n_filers_race_med_to_3rd))$
+           p.value,
+    
+    test_l_p_2_3 = prop.test(x=c(n_filers_q1_to_med,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_q1_to_med,n_filers_race_med_to_3rd))$
+           conf.int[1],
+         
+    test_u_p_2_3 = prop.test(x=c(n_filers_q1_to_med,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_q1_to_med,n_filers_race_med_to_3rd))$
+           conf.int[2],
+    
+    p.val_p_2_3 = prop.test(x=c(n_filers_q1_to_med,n_filers_med_to_3rd), 
+                            n=c(n_filers_race_q1_to_med,n_filers_race_med_to_3rd))$
+           p.value,
+    
+    test_diff_1_2 = t.test2(avg_d_first_q, avg_d_q1_to_med,
+                        sd_d_first_q,sd_d_q1_to_med,
+                        n_debts_first_q,n_debts_q1_to_med )[1],
+    
+    test_l_avg_1_2= test_diff_1_2-1.96*
+      t.test2(avg_d_first_q, avg_d_q1_to_med,
+              sd_d_first_q,sd_d_q1_to_med,
+              n_debts_first_q,n_debts_q1_to_med )[2],
+    
+    test_u_avg_1_2 = test_diff_1_2+1.96*
+      t.test2(avg_d_first_q, avg_d_q1_to_med,
+              sd_d_first_q,sd_d_q1_to_med,
+              n_debts_first_q,n_debts_q1_to_med )[2],
+    
+    p.val_avg_1_2=t.test2(avg_d_first_q, avg_d_q1_to_med,
+                           sd_d_first_q,sd_d_q1_to_med,
+                           n_debts_first_q,n_debts_q1_to_med )[4],
+    
+    test_diff_1_3 = t.test2(avg_d_first_q, avg_d_med_to_3rd ,
+                        sd_d_first_q,sd_d_med_to_3rd,
+                        n_debts_first_q,n_debts_med_to_3rd )[1],
+    
+    test_l_avg_1_3= test_diff_1_3-1.96*
+      t.test2(avg_d_first_q, avg_d_med_to_3rd ,
+              sd_d_first_q,sd_d_med_to_3rd,
+              n_debts_first_q,n_debts_med_to_3rd )[2],
+    
+    test_u_avg_1_3 = test_diff_1_3+1.96*
+      t.test2(avg_d_first_q, avg_d_med_to_3rd ,
+              sd_d_first_q,sd_d_med_to_3rd,
+              n_debts_first_q,n_debts_med_to_3rd )[2],
+    
+    p.val_avg_1_3=t.test2(avg_d_first_q, avg_d_med_to_3rd ,
+                           sd_d_first_q,sd_d_med_to_3rd,
+                           n_debts_first_q,n_debts_med_to_3rd )[4],
+    
+    test_diff_2_3 = t.test2(avg_d_q1_to_med, avg_d_med_to_3rd ,
+                        sd_d_q1_to_med,sd_d_med_to_3rd,
+                        n_debts_q1_to_med,n_debts_med_to_3rd )[1],
+    
+    test_l_avg_2_3= test_diff_2_3-1.96*
+      t.test2(avg_d_q1_to_med, avg_d_med_to_3rd ,
+              sd_d_q1_to_med,sd_d_med_to_3rd,
+              n_debts_q1_to_med,n_debts_med_to_3rd )[2],
+    
+    test_u_avg_2_3 = test_diff_2_3+1.96*
+      t.test2(avg_d_q1_to_med, avg_d_med_to_3rd ,
+              sd_d_q1_to_med,sd_d_med_to_3rd,
+              n_debts_q1_to_med,n_debts_med_to_3rd )[2],
+    
+    p.val_avg_2_3=t.test2(avg_d_q1_to_med, avg_d_med_to_3rd ,
+                           sd_d_q1_to_med,sd_d_med_to_3rd,
+                           n_debts_q1_to_med,n_debts_med_to_3rd )[4]
+         ) 
+
+#we've just done 208 hypothesis tests, so we absolutely need to correct for multiple 
+#comparisons. 
+
+p_adj<-p.adjust(c(diff_pand_tbl$p.val_p, diff_pand_tbl$p.val_avg,
+                  diff_pand_tbl_inc$p.val_p_1_2,
+                  diff_pand_tbl_inc$p.val_p_1_3,
+                  diff_pand_tbl_inc$p.val_p_2_3,
+                  diff_pand_tbl_inc$p.val_avg_1_2,
+                  diff_pand_tbl_inc$p.val_avg_1_3,
+                  diff_pand_tbl_inc$p.val_avg_2_3
+                  ), method = "BH")
+
+#i don't feel like typing where each set of tests starts and stops so i do this
+list_ps<- list(a =diff_pand_tbl$p.val_p,
+     b = diff_pand_tbl$p.val_avg,
+     c = diff_pand_tbl_inc$p.val_p_1_2,
+     d = diff_pand_tbl_inc$p.val_p_1_3,
+     e = diff_pand_tbl_inc$p.val_p_2_3,
+     f = diff_pand_tbl_inc$p.val_avg_1_2,
+     g = diff_pand_tbl_inc$p.val_avg_1_3,
+     h = diff_pand_tbl_inc$p.val_avg_2_3)
+
+list_lens<-lapply(list_ps, length) %>% unlist %>% cumsum
+
+p_adj_p <- p_adj[1:list_lens[1]]
+p_adj_avg <- p_adj[(list_lens[1]+1):list_lens[2]]
+p_adj_1_2 <- p_adj[ (list_lens[2]+1):list_lens[3]]
+p_adj_1_3 <- p_adj[ (list_lens[3]+1):list_lens[4]]
+p_adj_2_3 <- p_adj[ (list_lens[4]+1):list_lens[5]]
+p.adj_avg_1_2 <- p_adj[ (list_lens[5]+1):list_lens[6]]
+p.adj_avg_1_3 <- p_adj[ (list_lens[6]+1):list_lens[7]]
+p.adj_avg_2_3 <- p_adj[ (list_lens[7]+1):list_lens[8]]
+
+diff_pand_tbl$p.val_p<-p_adj_p
+diff_pand_tbl$p.val_avg<-p_adj_avg
+diff_pand_tbl_inc$p_adj_1_2<-p_adj_1_2
+diff_pand_tbl_inc$p_adj_1_3<-p_adj_1_3
+diff_pand_tbl_inc$p_adj_2_3<-p_adj_2_3
+diff_pand_tbl_inc$p.adj_avg_1_2<-p.adj_avg_1_2
+diff_pand_tbl_inc$p.adj_avg_1_3<-p.adj_avg_1_3
+diff_pand_tbl_inc$p.adj_avg_2_3<-p.adj_avg_2_3
+
+##now we pull out the differences that are below .1. These are largely guiding 
+##inferences that will inform what we look for later and that we will point to as 
+##worth investigating more. 
+
+diff_pand_tbl %>% filter((p.val_p<.1)) %>% 
+  select(naics_man_def,
+         diff_perc_race, test_l_p, test_u_p, p.val_p)
+
+diff_pand_tbl %>% filter((p.val_avg<.1)) %>% 
+  select(naics_man_def,
+         test_diff,test_l_avg,test_u_avg,p.val_avg)
+
+diff_pand_tbl_inc %>% filter(p_adj_1_2<.1) %>% 
+  mutate(diff_perc = perc_of_filers_first_q- perc_of_filers_q1_to_med) %>% 
+  select(naics_man_def, diff_perc,test_l_p_1_2,test_u_p_1_2,p.val_p_1_2)
+
+diff_pand_tbl_inc %>% filter(p_adj_1_3<.1) %>% 
+  mutate(diff_perc = perc_of_filers_first_q- perc_of_filers_med_to_3rd) %>% 
+  select(naics_man_def, diff_perc,test_l_p_1_3,test_u_p_1_3,p.val_p_1_3)
+
+diff_pand_tbl_inc %>% filter(p_adj_2_3<.1) %>% 
+  mutate(diff_perc = perc_of_filers_q1_to_med- perc_of_filers_med_to_3rd) %>% 
+  select(naics_man_def, diff_perc,test_l_p_2_3,test_u_p_2_3,p.val_p_2_3)
+
+diff_pand_tbl_inc %>% filter(p.adj_avg_1_2<.1) %>% 
+  select(naics_man_def, test_diff_1_2,test_l_avg_1_2,test_u_avg_1_2,p.adj_avg_1_2)
+
+diff_pand_tbl_inc %>% filter(p.adj_avg_1_3<.1) %>% 
+  select(naics_man_def, test_diff_1_3,test_l_avg_1_3,test_u_avg_1_3,p.adj_avg_1_3)
+
+diff_pand_tbl_inc %>% filter(p.adj_avg_2_3<.1) %>% 
+  select(naics_man_def, test_diff_2_3,test_l_avg_2_3,test_u_avg_2_3,p.adj_avg_2_3)
+
+```
+
+Here we find one of our first foundational inferences. While debtors differ in five categories by race, they differ in fourteen categories by income. In debt, as in many slices of economic and social life, people are more alike than different by race, but more different than alike by class. 
+
+Nonetheless, the race differences that do exist, are important. Black filers owe about \$6k and 13% more student loan debt than white filers, and they owe \$3k more auto debt.
+
+We examine these differences more carefully in the story itself. 
+
+Underwater mortgages is another place that we see discrepancies along race lines. We use the value of the secured and total portion of the loan to determine which loans over \$100k are worth more than the property securing them. We then group these by race.
+
+```{r}
+underwater_tbl<-D_sec_cred_naics_f_geo_f %>% group_by(loan_val_c, race_pred) %>%
+  summarise(n = n(), n_under = length(which(underwater)),
+            underwater = length(which(underwater))/n)
+
+D_mort <- read_csv("~/Downloads/state_GA.csv")
+
+#this shows that blacks pay higher interest rates and higher loan to value ratio. 
+#this is probably what account for it. 94% loan to value v 80% loan to value blk v wht
+D_cens_tract_mort<-D_mort %>% group_by(census_tract) %>% 
+  summarise(n =n(),
+            m_int = mean(interest_rate, na.rm=T), 
+            m_rat = median(loan_to_value_ratio, na.rm=T))
+
+#this says that the average black filer with housing debt in our dataset lived in a 
+#census tract where mortgage loans were 89% of the value of the house and paid an interest 
+#rate of over 5%. The average white filer lived in a census tract where loans were 85% of value
+#and paid an interest rate of 4.83.
+
+##even more specifically, black filers with mortgages underwater paid an average interest
+##rate of 5.21%, while white underwater filers paid an average of 4.9%. 
+
+```
+
+We see that about 1/3 of mortgages in Black neighborhoods are underwater, compared with about 23 percent of mortgages in white neighborhoods.
+
+We also use Federal Financial Institutions Examination Council (FFIEC) data on mortgage characteristics to try and understand the racial disparity. FFIEC data comes at the census tract level. We calculate aggregate mortgage characteristics per census tract and then spatially join geocoded filer addresses with the census tracts in the FFIEC data to determine the average mortgage characteristics of census tracts in which our filers live. Using this joined dataset, we can see whether there are differences in average characteristics by race. 
+
+We see that there are. Black neighborhoods pay see higher loan-to-value ratios from their beginnings and are subject to higher interest rates. 
+
+We have one final ~EDA. We present grouped bar charts that examine different debt distributions by race and income. These are the charts that feed the scrollytelling visualization and interactive in the story. 
+
+```{r}
+D_demo<-D_cred_naics_f %>%filter(amount_owed!="none")  %>% 
+  select(bk_id, race_pred, inc_level,case_chapter) %>% distinct
+  
+#this gives me the amount owed by each person and the percent of their amount owed that is 
+#due to each broad category. here we also  backfill the categories each debtor doesn't owe
+
+#only keep groups with more than 30
+D_perc_tot<-D_cred_naics_f %>%filter(amount_owed!="none") %>% 
+  group_by(bk_id, naics_man_def, pandemic) %>% 
+  summarise(val_debt = sum(as.numeric(amount_owed), na.rm=TRUE), med_ind = med_inc[1]) %>% 
+  group_by(bk_id, pandemic) %>% mutate(total_owed = sum(val_debt)) %>% 
+  mutate(perc_of_total=val_debt/total_owed) %>%
+  complete(bk_id, naics_man_def, pandemic) %>%
+  mutate(val_debt = replace_na(val_debt,0),
+         total_owed = max(total_owed, na.rm = TRUE),
+         perc_of_total = replace_na(perc_of_total,0)) %>% 
+  left_join(D_demo)%>% 
+  group_by( race_pred, inc_level, naics_man_def) %>% 
+  summarise(n_filers = length(unique(bk_id[which(perc_of_total>0)])),
+            med_perc = mean(perc_of_total),
+            sd(perc_of_total)) %>% 
+  filter(race_pred%in%c("hisp","other")==FALSE) %>% ungroup %>% filter(n_filers>20)
+
+D_perc_tot %>% filter(naics_man_def!="Warehouses-Mini & Self Storage") %>% 
+  arrange(desc(med_perc))  %>% na.omit %>% 
+  ggplot(aes(y = med_perc, x = naics_man_def, fill = race_pred))+
+  geom_bar(stat = "identity",position = "dodge")+facet_wrap(~inc_level)+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+D_perc_tot %>% mutate(m_sum= med_perc*n_filers) %>% group_by(race_pred, naics_man_def) %>% summarise(n_fil = sum(n_filers), m_perc = sum(m_sum)/n_fil) %>% filter(naics_man_def=="studentloan")
+```
+
+### Regression
+
+Finally, we want to examine the previously identified discrepancies in the presence of covariates. How, exactly, do race and class interact to create discrepancies in the kinds of debt owed? Does this differ at different wage levels? Pre/post-pandemic? Two-income households? Dependents?...
+
+To do this, we begin by preparing the data for Dirichlet regression as initially developed by Campbell and Mosimann (1987) and expanded and investigated by Hijazi (2003), (2006),..., and MJ Maier. 
+
+```{r}
+
+D_cred_naics_f_2<-D_cred_naics_f %>% mutate(
+  naics_man_def = fct_collapse(naics_man_def,
+                               medical = c("medical", "Skin Treatments", "medical_2"),
+                               professional = c("professional", "associations","tech","other_insurance"),
+                               personal = c("personal","household","housing"),
+                               sec_banking = c("sec_banking","sec_other","sec_credit_card","sec_other_loan"),
+                               auto = c("auto"),
+                               collections_pawn_payday = c("collections","pawn_payday", "credit_reporting"),
+                               tax_gov = c("taxes", "gov_legal"),
+                               mortgage = c("mortgage"),
+                               unsec_banking = c("unsec_other","unsec_banking","unsec_loans"),
+                               utilities = c("utilities"),
+                               student_loans = c("student_loans")
+                               
+                               
+                                                       )
+                          )
+
+D_cred_model<-D_cred_naics_f_2 %>%filter(amount_owed!="none") %>% 
+  group_by(bk_id, naics_man_def, pandemic) %>% 
+  summarise(val_debt = sum(as.numeric(amount_owed), na.rm=TRUE)) %>% 
+  group_by(bk_id, pandemic) %>% mutate(total_owed = sum(val_debt)) %>% 
+  mutate(perc_of_total=val_debt/total_owed) %>%
+  complete(bk_id, naics_man_def, pandemic) %>%
+  mutate(val_debt = replace_na(val_debt,0),
+         total_owed = max(total_owed, na.rm = TRUE),
+         perc_of_total = replace_na(perc_of_total,0)) %>% 
+  left_join(D_demo)%>% 
+  mutate(naics_man_def = droplevels(naics_man_def))
+
+D_dir_mod<-D_cred_model %>% select(-val_debt) %>% 
+  pivot_wider(names_from = naics_man_def, values_from = perc_of_total) %>% 
+  select(-"NA")
+
+D_covariates<-D_cred_naics_f_2 %>%filter(amount_owed!="none") %>% 
+  select(bk_id,mgw_1, mgw_2, rent_exp, child, food,mon_exp) %>% distinct %>% 
+  mutate(wage_1 = str_remove(mgw_1,"\\$") %>% str_remove(",") %>% as.numeric %>% 
+           replace_na(0),
+         
+         wage_2 = str_remove(mgw_2,"\\$") %>% str_remove(",") %>% as.numeric%>% 
+           replace_na(0),
+         
+         rent = str_remove(rent_exp,"\\$") %>% str_remove(",") %>% as.numeric%>% 
+           replace_na(0),
+         
+         child = str_remove(child,"\\$") %>% str_remove(",") %>% as.numeric%>% 
+           replace_na(0),
+         
+         food = str_remove(food,"\\$") %>% str_remove(",") %>% as.numeric%>% 
+           replace_na(0),
+         
+         exp = str_remove(mon_exp,"\\$") %>% as.numeric%>% 
+           replace_na(0),
+         wage = wage_1+wage_2
+         ) %>% 
+  select(bk_id, wage, rent, child, food, exp) 
+
+l <- 1
+
+D_dir_mod_f<-D_dir_mod %>% left_join(D_covariates, by = "bk_id") %>%
+  select(-none) %>% 
+  filter(race_pred!="mixed", inc_level!="upper+",medical<l&professional<l&personal<l&
+           sec_banking<l&auto<l&collections_pawn_payday<l&tax_gov<l&
+           mortgage<l&unsec_banking<l&
+           utilities<l&student_loans<l)
+           
+bk_perc_dir <- DR_data(D_dir_mod_f %>%ungroup %>%  select("medical",
+                                                          "personal","professional",
+                                              "sec_banking","auto",
+                                              "tax_gov",
+                                              "mortgage","collections_pawn_payday","utilities",
+                                              "student_loans",
+                                              "unsec_banking"))
+
+#model checking on dirichlet
+mod_dirich_1<-
+  DirichReg(
+    bk_perc_dir~race_pred+inc_level+case_chapter+wage+rent+child+food+exp+total_owed,
+    data= D_dir_mod_f, model = "common", control  = list(iterlim = 10000000))
+
+summary(mod_dirich_1)
+
+X_plot<-tibble(fitted =as.vector(mod_dirich_1$fitted.values$mu), 
+             residuals = as.vector(residuals(mod_dirich_1,"standardized")),
+       perc = as.vector(mod_dirich_1$Y)
+       )
+
+i = 25
+to_rm <- which(bk_perc_dir<3^-5)
+X_plot_i <- tibble(fitted =as.vector(mod_dirich_1$fitted.values$mu[-to_rm,]), 
+             residuals = as.vector(residuals(mod_dirich_1,"standardized")[-to_rm,]),
+       perc = as.vector(mod_dirich_1$Y[-to_rm,])
+       )
+
+#this confirms the guess that large residuals are due to observations with large 
+#concentrations of debt in one area. this is likely due to the stuff of life that isn't 
+#captured (and possible can't be captured) in the data
+X_plot %>% ggplot(aes(x = fitted, y = residuals, col = perc))+
+  geom_point(size = .1, alpha = .4)+labs(title = "Dirich Errors")
+
+X_plot_i %>% ggplot(aes(x = fitted, y = residuals, col = perc))+
+  geom_point(size = .1, alpha = .4)+labs(title = str_c("Dirich Errors for ", colnames(bk_perc_dir)[i]))
+
+  #race_pred+inc_level+case_chapter+wage+rent+child+food+exp+total_owed
+mod_dirich_alt<-DirichReg(bk_perc_dir~1, D_dir_mod_f)
+
+1-(log(mod_dirich_alt$logLik)/log(mod_dirich_1$logLik))^(2/nrow(bk_perc_dir))
+
+  #section to get pseudo r_2 from hijazi
+gm_mean = function(x, na.rm=TRUE){
+  return(exp(mean(log(x), na.rm = na.rm)))  
+}
+
+d_comp <- function(x, y){
+  inside = log(x/gm_mean(x))-log(y/gm_mean(y))
+  d = sqrt(sum(inside^2))
+  return(d)
+}
+
+#constant for closure
+g <- apply(mod_dirich_1$Y, 2, gm_mean)
+g <- g/sum(g)
+
+g_m <- apply(mod_dirich_1$Y, 2, mean)
+g_m <- g_m/sum(g_m)
+
+
+#using geometric
+R_2_trad<-1-sum((mod_dirich_1$fitted.values$mu-mod_dirich_1$Y)^2)/
+  sum(((replicate(nrow(mod_dirich_1$Y), g) %>% t)-mod_dirich_1$Y)^2)
+
+csst_vec <- rep(0, nrow(mod_dirich_1$Y))
+
+for(i in 1:nrow(mod_dirich_1$Y)){
+  csst_vec[i]<-d_comp(mod_dirich_1$Y[i,], g)
+}
+
+csst<-sum(csst_vec^2)
+
+csse_1_vec <- rep(0, nrow(mod_dirich_1$Y))
+
+for(i in 1:nrow(mod_dirich_1$Y)){
+  csse_1_vec[i]<-d_comp(mod_dirich_1$Y[i,], mod_dirich_1$fitted.values$alpha[i,])
+}
+
+csse_1<-sum(csse_1_vec^2)
+
+1-csse_1/csst
+
+csse_alt_vec <- rep(0, nrow(mod_dirich_1$Y))
+
+### limit analysis to obs in the middle of the simplex
+
+for(i in 1:nrow(mod_dirich_1$Y)){
+  csse_alt_vec[i]<-d_comp(mod_dirich_1$Y[i,], mod_dirich_alt$fitted.values$mu[i,])
+}
+
+csse_alt<-sum(csse_alt_vec^2)
+
+1-csse_alt/csst
+
+#using geometric mean trad
+1-sum((mod_dirich_1$fitted.values$mu-mod_dirich_1$Y)^2)/
+  sum(((replicate(nrow(mod_dirich_1$Y), g) %>% t)-mod_dirich_1$Y)^2)
+
+# mean
+1-sum((mod_dirich_1$fitted.values$mu-mod_dirich_1$Y)^2)/
+  sum(((replicate(nrow(mod_dirich_1$Y), g_m) %>% t)-mod_dirich_1$Y)^2)
+
+
+
+```
+
+As can be seen, while the inference reveals interesting connections between covariates and several of response proportions (as expected, those we have already examined: student loans, auto loans, mortgages,...), diagnostics and model fit at the level of the aggregated errors show that we're fitting the data rather poorly. Errors display several forms of significant dependence and overall residual analysis shows the model performs no better than well-chosen averages (Hijazi 2003).
+
+What is causing this?
+
+To simultaneously examine the somewhat contradictory inference and model-fitting results, as well as check for model dependence, we fit a logratio regression following the earliest work by Aitchison (1986).
+
+```{r}
+##comp reg
+bk_comp<-D_dir_mod_f %>%ungroup %>%  select("medical",
+                                                          "personal","professional",
+                                              "sec_banking","auto",
+                                              "tax_gov",
+                                              "mortgage","collections_pawn_payday","utilities",
+                                              "student_loans",
+                                              "unsec_banking")
+y_comp<-acomp(bk_comp)
+
+mylm <- lm(ilr(y_comp)~race_pred+inc_level+case_chapter+wage+rent+child+food+exp+total_owed,data= D_dir_mod_f)
+
+i = 10
+to_rm <- which(y_comp[,i+1]==0)
+plot(predict(mylm)[-to_rm,i],resid(mylm)[-to_rm,i])
+summary(mylm)[[i]]
+
+i = 9
+to_rm <- which(y_comp[,i+1]==0)
+plot(predict(mylm)[-to_rm,i],resid(mylm)[-to_rm,i])
+summary(mylm)[[i]]
+
+```
+
+Here we can see the prevailing cause of the contradiction. Some debt elements (student loans, auto, mortgage) show much better fits and diagnostics than others (unsec_loans, tech,...), making overall diagnostics misleading. Likewise, coefficient estimates from the logratio analysis are acceptably similar to results from Dirichlet regression. Given the necessary presence of outliers and Dirichlet regression's improved robustness to outliers, we report coefficients from the Dirichlet results in the story. 
+
+We also investigate discrepancies by raw totals. That is, what is the effect of being black or poor on the total amount of different kinds of debt a filer owes. It turns out that this modeling step is more effective that the previous. 
+
+Because of the zero-inflation observed in the data (there appears to be a separate point mass of filers who owe 0 student loans, 0 auto loans, but significant other loans), we fit a logistic regression to the filers who owe 0 student loans / auto loans, and a separate poisson regression for those who owe some amount of those debts. While zif models are sometimes overused, it makes conceptual sense that we are really modeling two separate populations here. We present the estimated probability differences below. 
+
+```{r}
+D_dir_mod_f_2<-D_dir_mod_f %>% filter(race_pred!="hisp") %>% 
+  mutate(inc_level = factor(inc_level, ordered = TRUE, levels = c("first_q", "q1_to_med", "med_to_3rd")),
+         y_sl = round(student_loans*total_owed),
+         sl_zer = sign(student_loans),
+         y_au=round(auto*total_owed),
+         au_zer = sign(auto))
+
+mod_gam_sl<-glm(y_sl~race_pred+inc_level+case_chapter+race_pred*inc_level+rent+child+food+exp+total_owed,family = "quasipoisson", data = D_dir_mod_f_2 %>% filter(student_loans>0))
+
+distplot(D_dir_mod_f_2%>% filter(student_loans>0) %>% pull(y_sl), type="poisson")
+par(mfrow=c(2,2))
+plot(mod_gam_sl)
+summary(mod_gam_sl)
+
+effects_sl_no_z<-allEffects(mod_gam_sl)
+plot(effects_sl_no_z$`race_pred:inc_level`)
+
+mod_gam_sl_z<-glm(sl_zer~race_pred+inc_level+case_chapter+race_pred*inc_level+rent+child+food+exp+total_owed,family = "binomial", data = D_dir_mod_f_2)
+
+summary(mod_gam_sl_z)
+
+effects_sl_z <- allEffects(mod_gam_sl_z)
+plot(effects_sl_z$`race_pred:inc_level`)
+
+mod_gam_auto_no_z<-glm(y_au~race_pred+inc_level+case_chapter+race_pred*inc_level+rent+child+food+exp+total_owed,family = "quasipoisson", data = D_dir_mod_f_2 %>% filter(auto>0))
+
+distplot(D_dir_mod_f_2%>% filter(student_loans>0) %>% pull(y_au), type="poisson")
+par(mfrow=c(2,2))
+plot(mod_gam_auto_no_z)
+summary(mod_gam_auto_no_z)
+
+effects_au_no_z<-allEffects(mod_gam_auto_no_z)
+plot(effects_au_no_z$`race_pred:inc_level`)
+
+mod_gam_auto_z<-glm(au_zer~race_pred+inc_level+case_chapter+race_pred*inc_level+rent+child+food+exp+total_owed,family = "binomial", data = D_dir_mod_f_2%>%  mutate(au_zer = sign(auto)) )
+
+summary(mod_gam_auto_z)
+effects_au_z <- allEffects(mod_gam_auto_z)
+plot(effects_au_z$`race_pred:inc_level`)
+
+```
+The majority of the output above is diagnostic and demonstrates much better fit that the Dirichlet regression. Fitting GAM's with smooth terms in the same families as the GLM's above improves the fit somewhat (both in terms of GOF and diagnostics), but makes explaining the results somewhat harder and limits the accessibility for a limit statistical improvement.
+
+Most interesting in what's seen above are the summary outputs and interaction plots. The summaries show that the relationships we identified earlier appear to remain relevant. Specifically, the relationship between race and the raw amount of student loan debt/the probability of having student loan debt are significant and sizable. The same is true for income and student loan debt. 
+
+The binomial interaction plots for student loans (plot 5) show the estimated probabilities of possessing student loan debt by race and class. This plot supports the argument in the race and class section of the story. As described there, Black filers are more likely to own student loan debt that white filers, but that wealthier black filers are slightly less likely than middle income white filers and much less likekly than poor Black filers. 
+
+The plot just prior to this, a quasi-poisson interaction plot, shows something similar but for raw debt totals. 
+
+The auto debt interaction plots, 8 (quasi-poisson) and 9 (binomial), show the interaction effects for raw totals of auto debt and probability of owing such debt. Our results here and in the summary ouput also support the claims made in the class section of the story. Auto debt varies more by income than race and we can make stronger statements about its variation.
+
+One final note worth mentioning is that all analyses here were first fit and chosen on a training set.
