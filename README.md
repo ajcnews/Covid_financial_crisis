@@ -1,7 +1,5 @@
 # Covid_financial_crisis
 
-README
-
 Nick Thieme, AJC
 
 Welcome to the code for the Atlanta Journal-Constitution's investigative series Covid Financial Crisis. 
