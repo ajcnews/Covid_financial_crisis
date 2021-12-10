@@ -8,6 +8,16 @@ This is the code underlying a number of stories at the AJC that investigated the
 
 This work was made possible by grants from The Pulitzer Center and the Brown Institute for Media Innovation at Columbia University, and by relationships with CUSIP Global Services and Pacer Monitor
 
+Below is the order that R script files should be run in to reproduce our story code. 
+
+1 and 2 produce the story in 6 (here)[https://www.ajc.com/news/falling-through-the-cracks-pandemic-exacts-heavy-financial-toll-on-georgians/NF6HBIU27FBXRLI6XB6T4QUGVA/].
+
+1, 2, 3, 4, and 5 produce the story in 7 (here)[https://www.ajc.com/investigations/georgia-bankruptcy-analysis/]
+
+8, 9, 10, and 11 produce the story in 12 (here)[https://www.ajc.com/news/investigations/covid-19s-hidden-cost-georgia-taxpayers-pay-more-for-public-debt-financing/MSAV3SZVDJHDZBDP7QDVABKWBE/]
+
+Please reach out to nicholas.thieme@ajc.com with any questions. 
+
 ## Order of operation
 
 1.	Sample_calculation_PACER.R
